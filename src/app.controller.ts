@@ -1,18 +1,19 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Header, Query } from '@nestjs/common';
 import { AppService } from './app.service';
-import Docker from 'dockerode';
-import stream from 'stream';
 import path from 'path';
+import Docker from 'dockerode';
+import { processAnsiText } from './utils';
 export enum DockerRunStatus {
   running = 'running',
   exited = 'exited',
 }
 const docker = new Docker();
-let result = '';
+
 @Controller()
 export class AppController {
   constructor(private readonly appService: AppService) {}
 
+  @Header('Access-Control-Allow-Origin', '*')
   @Get()
   async getHello(@Query() query): Promise<string> {
     async function getContainerLog(container: Docker.Container) {
@@ -28,44 +29,53 @@ export class AppController {
       const containerInfo = await container?.inspect();
       const isRunning = containerInfo.State.Running;
       if (!isRunning) {
-        result = outputString;
         container.remove({});
+        return outputString;
       }
     }
     // 这里\n之间不能留空格
     const wrapCode = `\n${decodeURI(query.code)}\nEOF\n`;
 
-    const bashCmd = `cat > code.txt << 'EOF' ${wrapCode} cat code.txt`;
-    const done = () => {
-      docker.createContainer(
-        {
-          Image: 'custom-node',
-          Cmd: ['/bin/bash', '-c', bashCmd],
-          StopTimeout: 6,
-          Tty: true,
-          AttachStdout: true,
-          NetworkDisabled: true,
-        },
-        function (err, container) {
-          console.log('===err', err);
-
-          container.start({}, function (err, data) {
-            container.attach(
-              { stream: true, stdout: true, stderr: true },
-              function (err, stream) {
-                stream.pipe(process.stdout);
-              },
-            );
-
-            container?.wait((status) => {
-              if (!status || status?.Status === DockerRunStatus.exited) {
-                getContainerLog(container);
+    const bashCmd = `cat > code.ts << 'EOF' ${wrapCode} ./node_modules/typescript/bin/tsc code.ts\nnode code.js`;
+    const done = () =>
+      new Promise<string>(async (resolve, reject) => {
+        docker.createContainer(
+          {
+            Image: 'custom-node',
+            Cmd: ['/bin/bash', '-c', bashCmd],
+            StopTimeout: 6,
+            Tty: true,
+            AttachStdout: true,
+            NetworkDisabled: true,
+          },
+          function (err, container) {
+            if (err) {
+              reject(err);
+            }
+            container.start({}, function (err, data) {
+              if (err) {
+                reject(err);
               }
+              container.attach(
+                { stream: true, stdout: true, stderr: true },
+                function (err, stream) {
+                  if (err) {
+                    reject(err);
+                  }
+                  stream.pipe(process.stdout);
+                },
+              );
+
+              container?.wait(async (status) => {
+                if (!status || status?.Status === DockerRunStatus.exited) {
+                  const logs = await getContainerLog(container);
+                  resolve(logs);
+                }
+              });
             });
-          });
-        },
-      );
-    };
+          },
+        );
+      });
     const image = docker.getImage('custom-node');
 
     if (!image) {
@@ -87,15 +97,15 @@ export class AppController {
             end: true,
           });
 
-          stream.on('end', function () {
-            done();
+          stream.on('end', async function () {
+            return await done();
           });
         },
       );
     } else {
-      done();
-    }
+      const res = await done();
 
-    return result;
+      return processAnsiText(res);
+    }
   }
 }
